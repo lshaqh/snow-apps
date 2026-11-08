@@ -151,6 +151,41 @@
         </message>
     </context>
     <context>
+        <name>ClipboardHistoryWindow</name>
+        <message>
+            <source>Clear history</source>
+            <translation>Clear history</translation>
+        </message>
+        <message>
+            <source>Clipboard history</source>
+            <translation>Clipboard history</translation>
+        </message>
+        <message>
+            <source>Double-click an item or press Enter to paste</source>
+            <translation>Double-click an item or press Enter to paste</translation>
+        </message>
+        <message>
+            <source>Keep at most</source>
+            <translation>Keep at most</translation>
+        </message>
+        <message>
+            <source>Record clipboard history</source>
+            <translation>Record clipboard history</translation>
+        </message>
+        <message>
+            <source>Search clipboard history</source>
+            <translation>Search clipboard history</translation>
+        </message>
+        <message>
+            <source>Use Win+V instead of the Windows clipboard history</source>
+            <translation>Use Win+V instead of the Windows clipboard history</translation>
+        </message>
+        <message>
+            <source>items</source>
+            <translation>items</translation>
+        </message>
+    </context>
+    <context>
         <name>CloudUploadSettingsWidget</name>
         <message>
             <source>%1 (Copy %2)</source>

@@ -2151,6 +2151,17 @@ if(APPLE)
     list(APPEND PROJECT_HEADERS include/snow_shot/platform/macos/applicationactivation.h)
 endif()
 
+# Clipboard history keeps its own JSON index and settings, so it does not join
+# any of the existing source groups. snow_shot_mini inherits these sources from
+# the snow_shot target automatically.
+list(APPEND PROJECT_CXX_SOURCES
+    src/presentation/services/clipboardhistorystore.cpp
+    src/presentation/services/clipboardhistorycontroller.cpp)
+list(APPEND PROJECT_HEADERS
+    include/snow_shot/presentation/clipboardhistoryguard.h
+    include/snow_shot/presentation/clipboardhistorystore.h
+    include/snow_shot/presentation/clipboardhistorycontroller.h)
+
 include(SnowSimd)
 snow_configure_avx2_sources(src/presentation/services/screenshotclipboarddibdecoder_avx2.cpp)
 
@@ -2168,6 +2179,10 @@ qt_add_executable(snow_shot
     ${PROJECT_SOURCES}
 )
 snow_shot_link_macos_window_platform(snow_shot)
+# The Win+V hook and clipboard sequence APIs live in user32.
+if(WIN32)
+    target_link_libraries(snow_shot PRIVATE user32)
+endif()
 if(WIN32 AND SNOW_SHOT_DISTRIBUTION_CHANNEL STREQUAL "store")
     add_dependencies(snow_shot snow_shot_explorer_command)
 endif()
@@ -11733,6 +11748,14 @@ if(SNOW_SHOT_BUILD_TESTS)
     target_link_libraries(snow-shot-feature-action-router-tests PRIVATE Qt6::Gui)
     add_test(NAME snow-shot-feature-action-router-tests COMMAND snow-shot-feature-action-router-tests)
     set_tests_properties(snow-shot-feature-action-router-tests PROPERTIES
+        LABELS unit SNOW_TEST_CROSS_PLATFORM TRUE)
+    add_executable(snow-shot-clipboard-history-guard-tests
+        tests/clipboard_history_guard_tests.cpp)
+    target_include_directories(snow-shot-clipboard-history-guard-tests PRIVATE include)
+    target_link_libraries(snow-shot-clipboard-history-guard-tests PRIVATE Qt6::Core)
+    add_test(NAME snow-shot-clipboard-history-guard-tests
+        COMMAND snow-shot-clipboard-history-guard-tests)
+    set_tests_properties(snow-shot-clipboard-history-guard-tests PROPERTIES
         LABELS unit SNOW_TEST_CROSS_PLATFORM TRUE)
     add_test(NAME snow-shot-screenshot-controller-lifetime-tests
         COMMAND snow_shot --controller-lifetime-tests)

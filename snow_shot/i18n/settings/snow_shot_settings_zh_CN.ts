@@ -151,6 +151,41 @@
         </message>
     </context>
     <context>
+        <name>ClipboardHistoryWindow</name>
+        <message>
+            <source>Clear history</source>
+            <translation>清空历史</translation>
+        </message>
+        <message>
+            <source>Clipboard history</source>
+            <translation>剪贴板历史</translation>
+        </message>
+        <message>
+            <source>Double-click an item or press Enter to paste</source>
+            <translation>双击条目或按回车粘贴</translation>
+        </message>
+        <message>
+            <source>Keep at most</source>
+            <translation>最多保留</translation>
+        </message>
+        <message>
+            <source>Record clipboard history</source>
+            <translation>记录剪贴板历史</translation>
+        </message>
+        <message>
+            <source>Search clipboard history</source>
+            <translation>搜索剪贴板历史</translation>
+        </message>
+        <message>
+            <source>Use Win+V instead of the Windows clipboard history</source>
+            <translation>使用 Win+V 替代 Windows 自带剪贴板历史</translation>
+        </message>
+        <message>
+            <source>items</source>
+            <translation>条</translation>
+        </message>
+    </context>
+    <context>
         <name>CloudUploadSettingsWidget</name>
         <message>
             <source>%1 (Copy %2)</source>

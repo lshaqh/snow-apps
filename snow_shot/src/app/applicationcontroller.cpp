@@ -34,6 +34,7 @@
 #include "snow_shot/presentation/screenshotexportcache.h"
 
 #include "snow_shot/presentation/globalshortcutmanager.h"
+#include "snow_shot/presentation/clipboardhistorycontroller.h"
 #include "snow_shot/presentation/globalcanvascontroller.h"
 #include "snow_shot/presentation/globalmousemanager.h"
 #include "snow_shot/presentation/mainwindow.h"
@@ -298,6 +299,8 @@ class ApplicationController::Impl {
                          &presentation::SystemTrayController::hide);
         QObject::connect(&app, &QCoreApplication::aboutToQuit, &globalMouseManager,
                          &presentation::GlobalMouseManager::shutdown);
+        QObject::connect(&app, &QCoreApplication::aboutToQuit, &clipboardHistory,
+                         &presentation::ClipboardHistoryController::shutdown);
         QObject::connect(
             &globalMouseManager, &presentation::GlobalMouseManager::operationFailed, &q,
             [this](const QString& message) {
@@ -1525,6 +1528,7 @@ class ApplicationController::Impl {
 #endif
         systemTray.show();
         globalShortcutManager.initialize();
+        clipboardHistory.start();
         globalMouseManager.setCaptureAvailable(ensureScreenshotController()->captureAvailable());
         globalMouseManager.initialize();
         QObject::connect(&app, &QGuiApplication::applicationStateChanged, &globalMouseManager,
@@ -2289,6 +2293,7 @@ class ApplicationController::Impl {
     presentation::PermissionGuideController permissionGuide{permissions};
 #endif
     presentation::GlobalMouseManager globalMouseManager;
+    presentation::ClipboardHistoryController clipboardHistory;
     // Settings are intentionally constructed on first window access.  The
     // tray and shortcut manager use only their compact bootstrap data.
     std::unique_ptr<presentation::settings::SettingsRegistry> settingsRegistry;

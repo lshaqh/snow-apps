@@ -25,6 +25,7 @@
     "AdministratorLaunch",
     "AutoStartRegistration",
     "AppPermissions",
+    "ClipboardHistoryWindow",
     "CloudUploadSettingsWidget",
     "CustomAiModelsSettingsWidget",
     "DrawingToolbarEditorSettingsWidget",
