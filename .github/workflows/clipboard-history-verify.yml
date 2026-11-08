@@ -11,19 +11,26 @@ name: Clipboard History Verification
 #   4. package    - full snow_shot installer, opt-in via inputs.full_package.
 #   5. probe      - cheap toolchain inventory on the hosted VS 2026 image.
 #
-# Toolchain facts (checked against actions/runner-images on 2026-11-08):
-# the stock `windows-2025-vs2026` HOSTED image already ships Visual Studio 18
-# 2026 (MSVC 14.5x), CMake 4.4.5, Ninja, Rust 1.99 and vcpkg. So the compiler
-# toolchain is NOT the blocker. What the hosted image does NOT ship is the
-# audited *static* Qt 6.12 kit (built from source with this repo's own patches
-# and stamp file) and the full pinned vcpkg source build (14 ports in the
-# snow-shot feature, including opencv4[contrib,dnn], ffmpeg 9.0, libheif[aom],
-# libjxl and crashpad). Those need tens of GB and multiple hours, against a
-# 14 GB SSD and a 6 h hard job limit on hosted runners.
+# Toolchain facts MEASURED on the hosted `windows-2025-vs2026` image
+# (workflow runs #8 / #9, 2026-11-08):
+#   - Visual Studio 18 2026 (18.11.3), MSVC 14.51.36231, CMake 4.4.5,
+#     Ninja 1.13.2, Rust 1.99.1 + pinned nightly, vcpkg. Every hard minimum
+#     (scripts/build-toolchain.json: MSVC 14.51 / Rust 1.97.1; bootstrap.ps1:
+#     CMake >= 4.2) is already satisfied. NO local toolchain is required.
+#   - Free disk: C: ~28 GB, D: ~147-220 GB; the workspace lives on D:.
+#   - Qt 6.12.0 source archive is reachable (443 MB); the pinned vcpkg
+#     baseline 4497409a47 clones and bootstraps fine; the OCR submodule
+#     resolves with `submodules: recursive`. With those in place the light
+#     bootstrap prints "Snow Apps build environment is ready." in ~40 s.
 #
-# Therefore level 3 ships the actual feature as a runnable portable program
-# linking the very same controller/store sources, while level 4 stays opt-in
-# for a prepared runner (or a hosted runner with a prebuilt dependency cache).
+# What the image still does NOT ship: any prebuilt Qt kit, and the compiled
+# vcpkg prefixes. Level 4 must BUILD (not install) the audited static Qt
+# 6.12.0 kit (repo-specific source patches + stamp, enforced by
+# package-snow-shot.ps1) plus a full source build of ~25 ports over two
+# triplets. That is hours of compile time, so it needs STAGED jobs (each job
+# has its own 6 h limit) with dependency artifacts / a cache between them.
+# Level 3 bypasses all of that and ships the same controller/store sources
+# as a portable program.
 on:
   # Pushing to main is intentionally NOT a trigger: the verifier dispatches
   # this workflow explicitly so the run is unambiguous and inputs are set.
@@ -419,12 +426,14 @@ jobs:
   # kit (SNOW_QT_STATIC_DIR) and the pinned vcpkg checkout. Stock GitHub
   # runners cannot satisfy these prerequisites, so this job is opt-in.
   package:
-    name: Full installer package (self-hosted only)
+    name: Full installer package (opt-in, staged build)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_package }}
     runs-on: ${{ inputs.runner_label || 'windows-2025-vs2026' }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Bootstrap pinned toolchain
         shell: pwsh
