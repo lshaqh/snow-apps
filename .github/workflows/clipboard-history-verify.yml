@@ -209,6 +209,26 @@ jobs:
           Copy-Item "build\clipboard-app\Release\snow_shot_clipboard_history.exe" -Destination $dist
           Copy-Item "LICENSE.md" -Destination $dist
 
+          # App-local VC++ 2022 CRT (Microsoft's documented local deployment
+          # layout), so the portable build also runs on machines that never
+          # installed the redistributable. Non-fatal if the runner layout differs.
+          $vsRoot = "${env:ProgramFiles}\Microsoft Visual Studio\2022"
+          $crt = Get-ChildItem -Path $vsRoot -Directory -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                  Get-ChildItem -Path "$($_.FullName)\VC\Redist\MSVC" -Directory `
+                      -ErrorAction SilentlyContinue
+              } | Sort-Object Name -Descending | Select-Object -First 1
+          if ($crt) {
+              $crtBin = "$($crt.FullName)\x64\Microsoft.VC143.CRT"
+              if (Test-Path $crtBin) {
+                  Copy-Item "$crtBin\*.dll" -Destination $dist
+                  Write-Host "Bundled VC++ CRT from $crtBin"
+              }
+          }
+          if (-not (Test-Path "$dist\vcruntime140.dll")) {
+              Write-Host "VC++ CRT not bundled; README documents the redistributable requirement."
+          }
+
           & "$env:QT_ROOT_DIR\bin\windeployqt.exe" `
               --release --no-translations --no-system-d3d-compiler --no-opengl-sw `
               "$dist\snow_shot_clipboard_history.exe"
@@ -224,6 +244,13 @@ jobs:
           设置：托盘右键可开关「接管 Win+V」；历史窗口内可调整保留条数（默认 200，上限 1000）。
           数据：历史保存在 %APPDATA%\snow-apps\SnowShotClipboardHistory\clipboard_history\。
           退出：托盘右键 -> 退出。关闭历史窗口不会退出程序。
+
+          运行依赖
+          --------
+          需要 Microsoft Visual C++ 2022 Redistributable (x64)。本包已尽量附带运行库 DLL；
+          若启动仍提示缺少 VCRUNTIME140.dll / MSVCP140.dll，请安装：
+          https://aka.ms/vs/17/release/vc_redist.x64.exe
+          NSIS 安装包 setup.exe 未做代码签名，Windows SmartScreen 可能拦截，选择「仍要运行」即可。
 
           说明
           ----
