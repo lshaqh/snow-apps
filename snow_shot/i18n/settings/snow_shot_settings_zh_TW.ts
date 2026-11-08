@@ -161,8 +161,8 @@
             <translation>剪貼簿歷史</translation>
         </message>
         <message>
-            <source>Double-click an item or press Enter to paste</source>
-            <translation>按兩下項目或按 Enter 貼上</translation>
+            <source>Double-click or press Enter to paste; Esc / Win+V again / click outside cancels</source>
+            <translation>按兩下或按 Enter 貼上；按 Esc、再按一次 Win+V 或點視窗外部取消</translation>
         </message>
         <message>
             <source>Keep at most</source>
@@ -175,6 +175,10 @@
         <message>
             <source>Search clipboard history</source>
             <translation>搜尋剪貼簿歷史</translation>
+        </message>
+        <message>
+            <source>Type letters or digits to filter; Up/Down selects</source>
+            <translation>輸入字母或數字篩選，上下鍵選擇</translation>
         </message>
         <message>
             <source>Use Win+V instead of the Windows clipboard history</source>

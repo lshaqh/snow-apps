@@ -104,7 +104,7 @@ for locale in ("en_US", "zh_CN", "zh_TW"):
         for message in context.findall("message"):
             entries[message.findtext("source")] = message.findtext("translation") or ""
     catalogs[locale] = entries
-check(len(sources) == 8, "源码可翻译文案共 8 条（实际 %d）" % len(sources))
+check(len(sources) == 9, "源码可翻译文案共 9 条（实际 %d）" % len(sources))
 for locale, entries in catalogs.items():
     missing = sorted(sources - set(entries))
     check(not missing, "%s 覆盖全部文案（缺失: %s）" % (locale, missing))
@@ -252,6 +252,34 @@ check(declared, "clipboardhistorystore.h 能解析出 m_ 成员声明")
 check(not undeclared,
       "clipboardhistorystore.h 内联访问器只返回已声明成员（未声明: %s）"
       % (", ".join(undeclared) if undeclared else "无"))
+
+print("\n=== 8. Win+V 交互与焦点回归护栏 ===")
+for needle, label in [
+    ("Qt::WindowDoesNotAcceptFocus", "历史窗口不接收键盘焦点"),
+    ("WA_ShowWithoutActivating", "show() 不激活窗口"),
+    ("GetGUIThreadInfo", "打开前快照输入焦点控件"),
+    ("WM_PASTE", "文本优先直接投递给编辑控件"),
+    ("SendMessageTimeoutW", "WM_PASTE 有超时保护"),
+    ("AttachThreadInput", "兜底路径可跨线程恢复前台"),
+    ("WH_MOUSE_LL", "点击窗口外部可取消"),
+    ("VK_ESCAPE", "Esc 可取消"),
+    ("toggleHistory()", "再按一次 Win+V 关闭"),
+    ("setPickerOpen(true)", "打开时启用键盘转发"),
+    ("setPickerOpen(false)", "关闭时停用键盘转发"),
+    ("restoreForeground(focus)", "回贴前恢复原前台窗口"),
+    ("suspendWinV(true)", "回贴时临时挂起 Win+V 拦截"),
+    ("suspendWinV(false)", "回贴后恢复 Win+V 拦截"),
+    ("isMenu(vk)", "Alt 组合键不被历史窗口误吞"),
+    ("!self->m_menuDown", "Alt 按住时放行系统快捷键"),
+]:
+    check(needle in cpp, label)
+for forbidden, label in [
+    ("m_popup->activateWindow()", "不再调用 activateWindow 抢焦点"),
+    ("m_search->setFocus()", "不再把焦点塞进搜索框"),
+    ("m_previousForeground", "旧前台窗口裸句柄已移除"),
+    ("SetForegroundWindow(m_previousForeground)", "旧的裸 SetForegroundWindow 已移除"),
+]:
+    check(forbidden not in cpp, label)
 
 print("\n" + "=" * 64)
 print("检查项 %d，失败 %d" % (CHECKS, len(FAILURES)))

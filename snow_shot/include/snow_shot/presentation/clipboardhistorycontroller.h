@@ -14,6 +14,11 @@ namespace snow_shot::presentation {
 // system-reserved combination; on other platforms only the recorder is active
 // until a platform-specific launcher is added.
 //
+// Pressing Win+V again, Esc or clicking outside cancels without touching the
+// clipboard. The picker never takes the foreground, so the original input
+// control (including the Explorer address bar) keeps its caret and the chosen
+// item can be pasted straight back into it.
+//
 // Re-pasted items are filtered with ClipboardHistoryGuard so the history never
 // grows from its own writes. Settings live in QSettings rather than the
 // configuration schema so the feature stays self-contained.

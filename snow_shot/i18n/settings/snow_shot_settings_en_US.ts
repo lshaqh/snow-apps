@@ -161,8 +161,8 @@
             <translation>Clipboard history</translation>
         </message>
         <message>
-            <source>Double-click an item or press Enter to paste</source>
-            <translation>Double-click an item or press Enter to paste</translation>
+            <source>Double-click or press Enter to paste; Esc / Win+V again / click outside cancels</source>
+            <translation>Double-click or press Enter to paste; Esc / Win+V again / click outside cancels</translation>
         </message>
         <message>
             <source>Keep at most</source>
@@ -175,6 +175,10 @@
         <message>
             <source>Search clipboard history</source>
             <translation>Search clipboard history</translation>
+        </message>
+        <message>
+            <source>Type letters or digits to filter; Up/Down selects</source>
+            <translation>Type letters or digits to filter; Up/Down selects</translation>
         </message>
         <message>
             <source>Use Win+V instead of the Windows clipboard history</source>

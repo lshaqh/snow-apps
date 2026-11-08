@@ -34,8 +34,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <utility>
 
 #ifdef Q_OS_WIN
@@ -53,7 +55,14 @@ class HistoryPopup final : public QWidget {
   public:
     explicit HistoryPopup(std::function<void()> onActivate, std::function<void()> onClose)
         : QWidget(nullptr), m_onActivate(std::move(onActivate)), m_onClose(std::move(onClose)) {
-        setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+        // The picker must never become the foreground window. Otherwise
+        // Explorer's address bar (and other inline editors) drops its caret and
+        // collapses as soon as the picker opens, so the later Ctrl+V has
+        // nowhere to land. Keyboard navigation is routed by the low-level
+        // hook instead of by Qt focus events.
+        setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint |
+                       Qt::WindowDoesNotAcceptFocus);
+        setAttribute(Qt::WA_ShowWithoutActivating, true);
         setWindowTitle(trHistory("Clipboard history"));
         resize(520, 460);
     }
@@ -94,9 +103,13 @@ constexpr WORD kMenuMaskVk = 0xE8;
 class WinVHotkeyHook final {
   public:
     using Activation = std::function<void()>;
+    using KeyNotification = std::function<void(std::uint32_t vk, bool shift)>;
+    using PointerNotification = std::function<void(int x, int y)>;
 
-    WinVHotkeyHook(QObject* owner, Activation activation)
-        : m_owner(owner), m_activation(std::move(activation)) {}
+    WinVHotkeyHook(QObject* owner, Activation activation, KeyNotification key,
+                   PointerNotification pointer)
+        : m_owner(owner), m_activation(std::move(activation)),
+          m_keyNotification(std::move(key)), m_pointerNotification(std::move(pointer)) {}
 
     ~WinVHotkeyHook() { stop(); }
 
@@ -114,12 +127,18 @@ class WinVHotkeyHook final {
             active_.store(this, std::memory_order_release);
             m_hook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboardProc,
                                        GetModuleHandleW(nullptr), 0);
+            m_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, mouseProc,
+                                            GetModuleHandleW(nullptr), 0);
             if (m_hook == nullptr) {
                 qWarning("Clipboard history Win+V hook failed: %lu",
                          static_cast<unsigned long>(GetLastError()));
                 active_.store(nullptr, std::memory_order_release);
             } else {
                 m_installed.store(true, std::memory_order_release);
+            }
+            if (m_mouseHook == nullptr) {
+                qWarning("Clipboard history outside-click hook failed: %lu",
+                         static_cast<unsigned long>(GetLastError()));
             }
         });
         m_thread.setObjectName(QStringLiteral("ClipboardHistoryWinVHook"));
@@ -139,6 +158,10 @@ class WinVHotkeyHook final {
                         UnhookWindowsHookEx(m_hook);
                         m_hook = nullptr;
                     }
+                    if (m_mouseHook != nullptr) {
+                        UnhookWindowsHookEx(m_mouseHook);
+                        m_mouseHook = nullptr;
+                    }
                 },
                 Qt::BlockingQueuedConnection);
         }
@@ -153,6 +176,14 @@ class WinVHotkeyHook final {
 
     void setTakeOverWinV(bool value) { m_takeOverWinV.store(value, std::memory_order_release); }
 
+    void setPickerOpen(bool value) {
+        m_pickerOpen.store(value, std::memory_order_release);
+    }
+
+    // Our own Ctrl+V must not be swallowed by the Win+V rule when the user
+    // still has the Win key held down while choosing an entry.
+    void suspendWinV(bool value) { m_suspendWinV.store(value, std::memory_order_release); }
+
   private:
     static bool isControl(DWORD vk) {
         return vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL;
@@ -160,6 +191,45 @@ class WinVHotkeyHook final {
 
     static bool isShift(DWORD vk) {
         return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT;
+    }
+
+    static bool isMenu(DWORD vk) {
+        return vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU;
+    }
+
+    static bool isNavigationKey(DWORD vk) {
+        return vk == VK_ESCAPE || vk == VK_RETURN || vk == VK_UP || vk == VK_DOWN ||
+               vk == VK_PRIOR || vk == VK_NEXT || vk == VK_HOME || vk == VK_END ||
+               vk == VK_BACK || vk == VK_DELETE;
+    }
+
+    static bool isPrintableKey(DWORD vk) {
+        if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9') ||
+            (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)) {
+            return true;
+        }
+        switch (vk) {
+        case VK_SPACE:
+        case VK_OEM_1:
+        case VK_OEM_2:
+        case VK_OEM_3:
+        case VK_OEM_4:
+        case VK_OEM_5:
+        case VK_OEM_6:
+        case VK_OEM_7:
+        case VK_OEM_PLUS:
+        case VK_OEM_COMMA:
+        case VK_OEM_MINUS:
+        case VK_OEM_PERIOD:
+        case VK_MULTIPLY:
+        case VK_ADD:
+        case VK_SUBTRACT:
+        case VK_DECIMAL:
+        case VK_DIVIDE:
+            return true;
+        default:
+            return false;
+        }
     }
 
     static LRESULT CALLBACK keyboardProc(int code, WPARAM message, LPARAM data) {
@@ -198,9 +268,14 @@ class WinVHotkeyHook final {
             self->m_shiftDown = down;
             return CallNextHookEx(nullptr, code, message, data);
         }
+        if (isMenu(vk)) {
+            self->m_menuDown = down;
+            return CallNextHookEx(nullptr, code, message, data);
+        }
         if (vk == 'V') {
             const bool winV = self->m_winDown &&
-                              self->m_takeOverWinV.load(std::memory_order_acquire);
+                              self->m_takeOverWinV.load(std::memory_order_acquire) &&
+                              !self->m_suspendWinV.load(std::memory_order_acquire);
             const bool fallback = self->m_controlDown && self->m_shiftDown;
             if (winV || fallback) {
                 if (down) {
@@ -212,6 +287,37 @@ class WinVHotkeyHook final {
                 // Swallow both V down and V up: the system Win+V panel never sees it.
                 return 1;
             }
+        }
+
+        // While the picker is visible it owns navigation keys and plain ASCII
+        // typing. It has no keyboard focus (by design), so the hook forwards
+        // these to the search box and swallows them so they never leak into
+        // the target editor. Modifier combos (Ctrl+C, Alt+Tab, ...) pass
+        // through untouched.
+        if (self->m_pickerOpen.load(std::memory_order_acquire)) {
+            const bool routed = isNavigationKey(vk) || isPrintableKey(vk);
+            const bool plain = !self->m_winDown && !self->m_controlDown && !self->m_menuDown;
+            if (down && plain && routed) {
+                self->m_swallowed[vk & 0xFF] = true;
+                self->notifyKey(static_cast<std::uint32_t>(vk), self->m_shiftDown);
+                return 1;
+            }
+            if (up && routed && self->m_swallowed[vk & 0xFF]) {
+                self->m_swallowed[vk & 0xFF] = false;
+                return 1;
+            }
+        }
+        return CallNextHookEx(nullptr, code, message, data);
+    }
+
+    static LRESULT CALLBACK mouseProc(int code, WPARAM message, LPARAM data) {
+        WinVHotkeyHook* self = active_.load(std::memory_order_acquire);
+        if (code == HC_ACTION && self != nullptr && data != 0 &&
+            self->m_pickerOpen.load(std::memory_order_acquire) &&
+            (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN ||
+             message == WM_MBUTTONDOWN)) {
+            const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(data);
+            self->notifyOutsideClick(mouse->pt.x, mouse->pt.y);
         }
         return CallNextHookEx(nullptr, code, message, data);
     }
@@ -242,21 +348,205 @@ class WinVHotkeyHook final {
             Qt::QueuedConnection);
     }
 
+    void notifyKey(std::uint32_t vk, bool shift) {
+        QObject* owner = m_owner.data();
+        if (owner == nullptr) {
+            return;
+        }
+        KeyNotification callback = m_keyNotification;
+        QMetaObject::invokeMethod(
+            owner,
+            [callback, vk, shift]() {
+                if (callback) {
+                    callback(vk, shift);
+                }
+            },
+            Qt::QueuedConnection);
+    }
+
+    void notifyOutsideClick(int x, int y) {
+        QObject* owner = m_owner.data();
+        if (owner == nullptr) {
+            return;
+        }
+        PointerNotification callback = m_pointerNotification;
+        QMetaObject::invokeMethod(
+            owner,
+            [callback, x, y]() {
+                if (callback) {
+                    callback(x, y);
+                }
+            },
+            Qt::QueuedConnection);
+    }
+
     static std::atomic<WinVHotkeyHook*> active_;
     QPointer<QObject> m_owner;
     Activation m_activation;
+    KeyNotification m_keyNotification;
+    PointerNotification m_pointerNotification;
     QThread m_thread;
     QObject* m_worker = nullptr;
     HHOOK m_hook = nullptr;
+    HHOOK m_mouseHook = nullptr;
     std::atomic<bool> m_installed{false};
     std::atomic<bool> m_takeOverWinV{true};
+    std::atomic<bool> m_pickerOpen{false};
+    std::atomic<bool> m_suspendWinV{false};
+    bool m_swallowed[256] = {}; // hook thread only: keys whose key-up we owe
     bool m_winDown = false;
     bool m_winConsumed = false;
     bool m_controlDown = false;
     bool m_shiftDown = false;
+    bool m_menuDown = false;
 };
 
 std::atomic<WinVHotkeyHook*> WinVHotkeyHook::active_{nullptr};
+
+// Win+V may be pressed while the caret sits in any control. Remember that
+// control before showing the picker, then paste back into it directly.
+
+struct FocusSnapshot {
+    HWND foreground = nullptr;
+    HWND focus = nullptr;
+    DWORD thread = 0;
+    bool editable = false;
+};
+
+bool isEditableControl(HWND window) {
+    if (window == nullptr) {
+        return false;
+    }
+    wchar_t className[64] = {};
+    if (GetClassNameW(window, className, 64) == 0) {
+        return false;
+    }
+    const std::wstring_view name(className);
+    // Explorer's address bar is an Edit inside a ComboBoxEx32; Notepad, Office
+    // cells and most editors use Edit/RichEdit as well.
+    return name.rfind(L"Edit", 0) == 0 || name.rfind(L"RichEdit", 0) == 0 ||
+           name.rfind(L"ComboBox", 0) == 0 || name.rfind(L"AtlEdit", 0) == 0 ||
+           name.rfind(L"Scintilla", 0) == 0 || name.rfind(L"TextBox", 0) == 0;
+}
+
+FocusSnapshot captureFocusSnapshot() {
+    FocusSnapshot snapshot;
+    snapshot.foreground = GetForegroundWindow();
+    GUITHREADINFO info{};
+    info.cbSize = sizeof(GUITHREADINFO);
+    if (GetGUIThreadInfo(0, &info)) {
+        snapshot.focus = info.hwndFocus != nullptr ? info.hwndFocus : info.hwndActive;
+    }
+    if (snapshot.focus == nullptr) {
+        snapshot.focus = snapshot.foreground;
+    }
+    if (snapshot.focus != nullptr) {
+        snapshot.thread = GetWindowThreadProcessId(snapshot.focus, nullptr);
+    }
+    snapshot.editable = isEditableControl(snapshot.focus);
+    return snapshot;
+}
+
+void restoreForeground(const FocusSnapshot& snapshot) {
+    if (snapshot.foreground == nullptr || !IsWindow(snapshot.foreground)) {
+        return;
+    }
+    // The picker deliberately never activates, so this is the common case;
+    // do not disturb the caret by forcing a focus change.
+    if (GetForegroundWindow() == snapshot.foreground) {
+        return;
+    }
+    const DWORD current = GetCurrentThreadId();
+    const DWORD target = snapshot.thread != 0
+                             ? snapshot.thread
+                             : GetWindowThreadProcessId(snapshot.foreground, nullptr);
+    const bool attached = target != 0 && target != current &&
+                          AttachThreadInput(current, target, TRUE) != FALSE;
+    if (IsIconic(snapshot.foreground)) {
+        ShowWindow(snapshot.foreground, SW_RESTORE);
+    }
+    BringWindowToTop(snapshot.foreground);
+    SetForegroundWindow(snapshot.foreground);
+    for (int attempt = 0;
+         attempt < 12 && GetForegroundWindow() != snapshot.foreground; ++attempt) {
+        Sleep(10);
+    }
+    if (snapshot.editable && snapshot.focus != nullptr && IsWindow(snapshot.focus)) {
+        SetFocus(snapshot.focus);
+    }
+    if (attached) {
+        AttachThreadInput(current, target, FALSE);
+    }
+}
+
+bool pasteIntoFocus(const FocusSnapshot& snapshot) {
+    if (!snapshot.editable || snapshot.focus == nullptr || !IsWindow(snapshot.focus) ||
+        !IsWindowVisible(snapshot.focus)) {
+        return false;
+    }
+    DWORD_PTR result = 0;
+    // WM_PASTE reaches the edit control that owns the caret without any
+    // foreground switch. That is what keeps Explorer's address bar in edit
+    // mode. A UIPI or hung-window failure falls back to the Ctrl+V path.
+    return SendMessageTimeoutW(snapshot.focus, WM_PASTE, 0, 0, SMTO_ABORTIFHUNG, 250,
+                               &result) != 0;
+}
+
+QString makeChar(ushort code) { return QString(QChar(static_cast<char16_t>(code))); }
+
+QString mapPrintableKey(DWORD vk, bool shift) {
+    if (vk >= 'A' && vk <= 'Z') {
+        return makeChar(static_cast<ushort>(shift ? vk : vk + 32));
+    }
+    if (vk >= '0' && vk <= '9') {
+        const char shifted[] = ")!@#$%^&*(";
+        const ushort code = shift ? static_cast<ushort>(static_cast<unsigned char>(shifted[vk - '0']))
+                                  : static_cast<ushort>('0' + (vk - '0'));
+        return makeChar(code);
+    }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
+        return makeChar(static_cast<ushort>('0' + (vk - VK_NUMPAD0)));
+    }
+    switch (vk) {
+    case VK_SPACE:
+        return QStringLiteral(" ");
+    case VK_OEM_MINUS:
+        return makeChar(static_cast<ushort>(shift ? u'_' : u'-'));
+    case VK_OEM_PLUS:
+        return makeChar(static_cast<ushort>(shift ? u'+' : u'='));
+    case VK_OEM_1:
+        return makeChar(static_cast<ushort>(shift ? u':' : u';'));
+    case VK_OEM_2:
+        return makeChar(static_cast<ushort>(shift ? u'?' : u'/'));
+    case VK_OEM_3:
+        return makeChar(static_cast<ushort>(shift ? u'~' : u'`'));
+    case VK_OEM_4:
+        return makeChar(static_cast<ushort>(shift ? u'{' : u'['));
+    case VK_OEM_5:
+        return makeChar(static_cast<ushort>(shift ? u'|' : u'\\'));
+    case VK_OEM_6:
+        return makeChar(static_cast<ushort>(shift ? u'}' : u']'));
+    case VK_OEM_7:
+        return makeChar(static_cast<ushort>(shift ? u'"' : u'\''));
+    case VK_OEM_COMMA:
+        return makeChar(static_cast<ushort>(shift ? u'<' : u','));
+    case VK_OEM_PERIOD:
+        return makeChar(static_cast<ushort>(shift ? u'>' : u'.'));
+    case VK_MULTIPLY:
+        return makeChar(static_cast<ushort>(u'*'));
+    case VK_ADD:
+        return makeChar(static_cast<ushort>(u'+'));
+    case VK_SUBTRACT:
+        return makeChar(static_cast<ushort>(u'-'));
+    case VK_DECIMAL:
+        return makeChar(static_cast<ushort>(u'.'));
+    case VK_DIVIDE:
+        return makeChar(static_cast<ushort>(u'/'));
+    default:
+        break;
+    }
+    return {};
+}
 
 void sendPasteKeystroke() {
     INPUT inputs[4] = {};
@@ -305,7 +595,10 @@ class ClipboardHistoryController::Impl final : public QObject {
                          &Impl::onClipboardChanged);
 
 #ifdef Q_OS_WIN
-        m_hook = std::make_unique<WinVHotkeyHook>(this, [this]() { openHistory(); });
+        m_hook = std::make_unique<WinVHotkeyHook>(
+            this, [this]() { toggleHistory(); },
+            [this](std::uint32_t vk, bool shift) { onPickerKey(vk, shift); },
+            [this](int x, int y) { onOutsideClick(x, y); });
         m_hook->setTakeOverWinV(m_takeOverWinV);
         if (!m_hook->start()) {
             qWarning("Clipboard history Win+V takeover unavailable; "
@@ -330,9 +623,32 @@ class ClipboardHistoryController::Impl final : public QObject {
         }
 #endif
         static_cast<void>(m_store.save());
-        if (m_popup != nullptr) {
+        closeHistory();
+    }
+
+    // Win+V is a toggle: pressing it again dismisses the picker without
+    // touching the clipboard. Esc and a click outside do the same.
+    void toggleHistory() {
+        if (!m_enabled) {
+            return;
+        }
+        if (m_popup != nullptr && m_popup->isVisible()) {
+            closeHistory();
+            return;
+        }
+        openHistory();
+    }
+
+    void closeHistory() {
+        if (m_popup != nullptr && m_popup->isVisible()) {
             m_popup->hide();
         }
+#ifdef Q_OS_WIN
+        if (m_hook != nullptr) {
+            m_hook->setPickerOpen(false);
+        }
+        m_focusSnapshot = FocusSnapshot{};
+#endif
     }
 
     void openHistory() {
@@ -342,13 +658,97 @@ class ClipboardHistoryController::Impl final : public QObject {
         ensureWindow();
         rebuildList();
 #ifdef Q_OS_WIN
-        m_previousForeground = GetForegroundWindow();
+        // Remember the caret owner before the picker appears. show()/raise()
+        // must not activate it: the target editor keeps the foreground.
+        m_focusSnapshot = captureFocusSnapshot();
 #endif
         m_popup->show();
         m_popup->raise();
-        m_popup->activateWindow();
         m_search->clear();
-        m_search->setFocus();
+#ifdef Q_OS_WIN
+        if (m_hook != nullptr) {
+            m_hook->setPickerOpen(true);
+        }
+#endif
+    }
+
+    void onOutsideClick(int x, int y) {
+        if (m_popup == nullptr || !m_popup->isVisible()) {
+            return;
+        }
+#ifdef Q_OS_WIN
+        RECT rect{};
+        const HWND handle = reinterpret_cast<HWND>(m_popup->winId());
+        if (handle != nullptr && GetWindowRect(handle, &rect) && x >= rect.left &&
+            x <= rect.right && y >= rect.top && y <= rect.bottom) {
+            return;
+        }
+#else
+        Q_UNUSED(x);
+        Q_UNUSED(y);
+#endif
+        closeHistory();
+    }
+
+    void onPickerKey(std::uint32_t key, bool shift) {
+        if (m_popup == nullptr || !m_popup->isVisible()) {
+            return;
+        }
+#ifdef Q_OS_WIN
+        switch (static_cast<DWORD>(key)) {
+        case VK_ESCAPE:
+            closeHistory();
+            return;
+        case VK_RETURN:
+            pasteCurrentRow();
+            return;
+        case VK_UP:
+            moveSelection(-1);
+            return;
+        case VK_DOWN:
+            moveSelection(1);
+            return;
+        case VK_PRIOR:
+            moveSelection(-5);
+            return;
+        case VK_NEXT:
+            moveSelection(5);
+            return;
+        case VK_HOME:
+        case VK_END:
+            m_list->setCurrentRow(static_cast<DWORD>(key) == VK_HOME ? 0
+                                                                     : m_list->count() - 1);
+            return;
+        case VK_BACK: {
+            QString text = m_search->text();
+            if (!text.isEmpty()) {
+                text.chop(1);
+                m_search->setText(text);
+            }
+            return;
+        }
+        case VK_DELETE:
+            return;
+        default:
+            break;
+        }
+        const QString typed = mapPrintableKey(static_cast<DWORD>(key), shift);
+        if (!typed.isEmpty()) {
+            m_search->setText(m_search->text() + typed);
+        }
+#else
+        Q_UNUSED(key);
+        Q_UNUSED(shift);
+#endif
+    }
+
+    void moveSelection(int delta) {
+        if (m_list == nullptr || m_list->count() == 0) {
+            return;
+        }
+        const int current = m_list->currentRow() < 0 ? 0 : m_list->currentRow();
+        const int next = std::max(0, std::min(current + delta, m_list->count() - 1));
+        m_list->setCurrentRow(next);
     }
 
     [[nodiscard]] bool enabled() const { return m_enabled; }
@@ -362,6 +762,9 @@ class ClipboardHistoryController::Impl final : public QObject {
         }
         m_enabled = value;
         writeSettings();
+        if (!m_enabled) {
+            closeHistory();
+        }
 #ifdef Q_OS_WIN
         // When disabled, Win+V must fall through to the system clipboard panel.
         if (m_hook != nullptr) {
@@ -422,7 +825,8 @@ class ClipboardHistoryController::Impl final : public QObject {
         if (m_popup != nullptr) {
             return;
         }
-        m_popup = new HistoryPopup([this]() { pasteCurrentRow(); }, []() {});
+        m_popup = new HistoryPopup([this]() { pasteCurrentRow(); },
+                                   [this]() { closeHistory(); });
         auto* layout = new QVBoxLayout(m_popup);
 
         m_search = new QLineEdit(m_popup);
@@ -432,9 +836,16 @@ class ClipboardHistoryController::Impl final : public QObject {
         m_list = new QListWidget(m_popup);
         layout->addWidget(m_list, 1);
 
-        auto* hint = new QLabel(trHistory("Double-click an item or press Enter to paste"),
-                                m_popup);
+        auto* hint = new QLabel(
+            trHistory("Double-click or press Enter to paste; Esc / Win+V again / click outside cancels"),
+            m_popup);
+        hint->setWordWrap(true);
         layout->addWidget(hint);
+
+        auto* searchHint = new QLabel(
+            trHistory("Type letters or digits to filter; Up/Down selects"), m_popup);
+        searchHint->setWordWrap(true);
+        layout->addWidget(searchHint);
 
         m_enabledBox = new QCheckBox(trHistory("Record clipboard history"), m_popup);
         m_enabledBox->setChecked(m_enabled);
@@ -615,14 +1026,34 @@ class ClipboardHistoryController::Impl final : public QObject {
 #endif
         m_guard.markOwnWrite(writtenSequence, QDateTime::currentMSecsSinceEpoch());
 
-        if (m_popup != nullptr) {
-            m_popup->hide();
-        }
 #ifdef Q_OS_WIN
-        if (m_previousForeground != nullptr) {
-            SetForegroundWindow(m_previousForeground);
-        }
-        sendPasteKeystroke();
+        // closeHistory() clears the snapshot, so keep a copy first.
+        const FocusSnapshot focus = m_focusSnapshot;
+        const bool textLike = entry.kind == ClipboardHistoryKind::Text ||
+                              entry.kind == ClipboardHistoryKind::Html;
+#endif
+        closeHistory();
+#ifdef Q_OS_WIN
+        // Let Windows process the hide, then paste into the control that owned
+        // the caret. Native edit controls (Explorer address bar, Notepad, ...)
+        // accept WM_PASTE directly; everything else gets a normal Ctrl+V.
+        QTimer::singleShot(40, this, [this, focus, textLike]() {
+            restoreForeground(focus);
+            if (textLike && pasteIntoFocus(focus)) {
+                return;
+            }
+            // Do not let our own Win+V rule swallow the Ctrl+V we are about
+            // to send if the user still holds the Win key down.
+            if (m_hook != nullptr) {
+                m_hook->suspendWinV(true);
+            }
+            sendPasteKeystroke();
+            QTimer::singleShot(150, this, [this]() {
+                if (m_hook != nullptr) {
+                    m_hook->suspendWinV(false);
+                }
+            });
+        });
 #endif
     }
 
@@ -666,7 +1097,7 @@ class ClipboardHistoryController::Impl final : public QObject {
     std::uint32_t m_syntheticSequence = 0;
 #ifdef Q_OS_WIN
     std::unique_ptr<WinVHotkeyHook> m_hook;
-    HWND m_previousForeground = nullptr;
+    FocusSnapshot m_focusSnapshot;
 #endif
 };
 
