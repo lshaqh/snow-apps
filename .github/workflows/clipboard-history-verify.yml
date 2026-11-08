@@ -8,15 +8,22 @@ name: Clipboard History Verification
 #                   controller/store translation units used by snow_shot,
 #                   deployed with windeployqt and shipped as a zip plus an
 #                   optional NSIS setup.exe. Runs on a hosted runner.
-#   4. package    - full snow_shot installer; requires a self-hosted runner
-#                   preloaded with VS 18 2026, the custom static Qt 6.12 kit
-#                   and the pinned vcpkg baseline. Disabled by default.
+#   4. package    - full snow_shot installer, opt-in via inputs.full_package.
+#   5. probe      - cheap toolchain inventory on the hosted VS 2026 image.
 #
-# Why level 3 exists: the full snow_shot build hard-requires MSVC >= 14.51
-# (VS 18 2026), CMake >= 4.2, an audited *static* Qt 6.12.0 kit and a full
-# vcpkg source build (opencv4[contrib,dnn], ffmpeg 9.0, ...). None of that is
-# available on GitHub-hosted runners, and a single job would exceed the 6h
-# limit. Level 3 ships the actual feature as a runnable, portable program.
+# Toolchain facts (checked against actions/runner-images on 2026-11-08):
+# the stock `windows-2025-vs2026` HOSTED image already ships Visual Studio 18
+# 2026 (MSVC 14.5x), CMake 4.4.5, Ninja, Rust 1.99 and vcpkg. So the compiler
+# toolchain is NOT the blocker. What the hosted image does NOT ship is the
+# audited *static* Qt 6.12 kit (built from source with this repo's own patches
+# and stamp file) and the full pinned vcpkg source build (14 ports in the
+# snow-shot feature, including opencv4[contrib,dnn], ffmpeg 9.0, libheif[aom],
+# libjxl and crashpad). Those need tens of GB and multiple hours, against a
+# 14 GB SSD and a 6 h hard job limit on hosted runners.
+#
+# Therefore level 3 ships the actual feature as a runnable portable program
+# linking the very same controller/store sources, while level 4 stays opt-in
+# for a prepared runner (or a hosted runner with a prebuilt dependency cache).
 on:
   # Pushing to main is intentionally NOT a trigger: the verifier dispatches
   # this workflow explicitly so the run is unambiguous and inputs are set.
@@ -46,9 +53,13 @@ on:
         default: false
         type: boolean
       runner_label:
-        description: Self-hosted runner label used by the full_package job
+        description: Runner label used by the full_package job (hosted VS2026 image or prepared self-hosted)
         default: 'windows-2025-vs2026'
         type: string
+      probe_full_env:
+        description: Run a cheap toolchain inventory + light bootstrap probe on the hosted VS2026 image
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -58,6 +69,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  probe-full-env:
+    name: Probe VS2026 hosted toolchain
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.probe_full_env }}
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inventory preinstalled toolchain
+        shell: pwsh
+        run: |
+          Write-Host "=== CMake / Ninja / Rust ==="
+          cmake --version | Select-Object -First 1
+          ninja --version
+          rustc --version
+          cargo --version
+          Write-Host "=== Visual Studio ==="
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -latest -products * -property catalog_productDisplayVersion
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          Write-Host "VS root: $vsRoot"
+          Write-Host "=== MSVC toolsets ==="
+          Get-ChildItem -LiteralPath (Join-Path $vsRoot "VC\Tools\MSVC") -Directory |
+            Select-Object -ExpandProperty Name
+          Write-Host "=== Disk ==="
+          Get-PSDrive -Name C,D -ErrorAction SilentlyContinue |
+            Select-Object Name,
+              @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}},
+              @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}} |
+            Format-Table -AutoSize | Out-String | Write-Host
+          Write-Host "=== Preinstalled Qt kits ==="
+          foreach ($root in @("C:\Qt", "$env:Qt6_DIR", "$env:SNOW_QT_STATIC_DIR")) {
+            if ($root) {
+              if (Test-Path -LiteralPath $root) { Write-Host "Qt present: $root" }
+              else { Write-Host "Qt absent : $root" }
+            }
+          }
+          Write-Host "=== Hosted vcpkg ==="
+          $hostedVcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
+          if (Test-Path -LiteralPath $hostedVcpkg) { & $hostedVcpkg version --disable-metrics }
+
+      - name: Light bootstrap probe (no vcpkg source build, no static Qt)
+        id: bootstrap_probe
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          ./scripts/bootstrap.ps1 -Preset snow-shot-msvc-fast -Architecture x64 `
+            -SkipVcpkgInstall -SkipDependencyInstall -SkipQtValidation
+
+      - name: Probe verdict
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "bootstrap outcome: ${{ steps.bootstrap_probe.outcome }}"
+          if ("${{ steps.bootstrap_probe.outcome }}" -ne "success") {
+            Write-Host "The light bootstrap failed; its log shows the exact gate that blocks the hosted runner."
+          } else {
+            Write-Host "Compiler toolchain, pinned vcpkg checkout and Rust toolchain are usable on this hosted image."
+          }
+
   logic:
     name: Logic, wiring, catalogs
     runs-on: ubuntu-latest
