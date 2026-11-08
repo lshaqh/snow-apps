@@ -1,12 +1,22 @@
 name: Clipboard History Verification
 
-# Verification levels:
+# Verification / packaging levels:
 #   1. logic      - pure C++/Python checks, no toolchain needed (seconds)
 #   2. smoke      - real C++ compile + link against an official Qt desktop kit
 #                   on a stock GitHub-hosted Windows runner (minutes)
-#   3. package    - full snow_shot installer; requires a self-hosted runner
+#   3. portable   - distributable Win+V clipboard-history build: the same
+#                   controller/store translation units used by snow_shot,
+#                   deployed with windeployqt and shipped as a zip plus an
+#                   optional NSIS setup.exe. Runs on a hosted runner.
+#   4. package    - full snow_shot installer; requires a self-hosted runner
 #                   preloaded with VS 18 2026, the custom static Qt 6.12 kit
 #                   and the pinned vcpkg baseline. Disabled by default.
+#
+# Why level 3 exists: the full snow_shot build hard-requires MSVC >= 14.51
+# (VS 18 2026), CMake >= 4.2, an audited *static* Qt 6.12.0 kit and a full
+# vcpkg source build (opencv4[contrib,dnn], ffmpeg 9.0, ...). None of that is
+# available on GitHub-hosted runners, and a single job would exceed the 6h
+# limit. Level 3 ships the actual feature as a runnable, portable program.
 on:
   # Pushing to main is intentionally NOT a trigger: the verifier dispatches
   # this workflow explicitly so the run is unambiguous and inputs are set.
@@ -21,6 +31,7 @@ on:
       - 'snow_shot/i18n/**'
       - 'snow_shot/tests/clipboard_history_guard_tests.cpp'
       - 'snow_shot/tests/clipboard_history_smoke/**'
+      - 'snow_shot/tests/clipboard_history_app/**'
       - 'scripts/verify-clipboard-history.py'
       - 'scripts/verify-win-v-hotkey.py'
       - '.github/workflows/clipboard-history-verify.yml'
@@ -159,6 +170,106 @@ jobs:
             build/clipboard-smoke/**/snow_shot_clipboard_history.lib
             build/clipboard-smoke/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
+
+  portable:
+    name: Portable Win+V clipboard history package
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # install-qt-action installs its own Python >= 3.14 for aqtinstall.
+      - name: Install Qt 6.12.0 (official dynamic kit)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.12.0'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          dir: ${{ runner.workspace }}/qt-portable
+          cache: true
+          aqtsource: git+https://github.com/jdpurcell/aqtinstall.git@6f0f842da47c744cdc814cd94da9828d934d7bf0
+
+      - name: Build the standalone tray application
+        shell: pwsh
+        run: |
+          cmake -S snow_shot/tests/clipboard_history_app `
+                -B build/clipboard-app `
+                -G "Visual Studio 17 2022" -A x64 `
+                "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
+          cmake --build build/clipboard-app --config Release --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw 'C++ compile/link failed.' }
+
+      - name: Deploy Qt runtime and build the portable zip
+        shell: pwsh
+        run: |
+          $dist = "dist\snow-shot-clipboard-history-win64"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "build\clipboard-app\Release\snow_shot_clipboard_history.exe" -Destination $dist
+          Copy-Item "LICENSE.md" -Destination $dist
+
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" `
+              --release --no-translations --no-system-d3d-compiler --no-opengl-sw `
+              "$dist\snow_shot_clipboard_history.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed.' }
+
+          $readme = @"
+          Snow Shot 剪贴板历史（Win+V 便携版）
+          =====================================
+
+          运行：双击 snow_shot_clipboard_history.exe，程序常驻系统托盘。
+          唤起：Win+V（默认接管）或 Ctrl+Shift+V（兜底）。
+          选择：在历史窗口里双击条目，或选中后按 Enter，即回贴到当前焦点窗口。
+          设置：托盘右键可开关「接管 Win+V」；历史窗口内可调整保留条数（默认 200，上限 1000）。
+          数据：历史保存在 %APPDATA%\snow-apps\SnowShotClipboardHistory\clipboard_history\。
+          退出：托盘右键 -> 退出。关闭历史窗口不会退出程序。
+
+          说明
+          ----
+          本包只包含剪贴板历史功能，使用与 snow_shot 集成版相同的控制器/存储源码，
+          不依赖完整 snow_shot 的静态 Qt、vcpkg、Rust 与 OCR 工具链。
+          关闭「接管 Win+V」后，Win+V 会恢复为 Windows 自带剪贴板面板。
+
+          许可证：GPL-3.0-or-later，详见 LICENSE.md。
+          源码：https://github.com/lshaqh/snow-apps
+          "@
+          Set-Content -Path "$dist\README.txt" -Value $readme -Encoding utf8
+
+          Compress-Archive -Path "$dist\*" `
+              -DestinationPath "snow-shot-clipboard-history-win64.zip" -Force
+          $hash = (Get-FileHash "snow-shot-clipboard-history-win64.zip" -Algorithm SHA256).Hash
+          Set-Content -Path "snow-shot-clipboard-history-win64.zip.sha256" `
+              -Value "$hash  snow-shot-clipboard-history-win64.zip" -Encoding utf8
+          Write-Host "Portable zip: $((Get-Item 'snow-shot-clipboard-history-win64.zip').Length) bytes  sha256=$hash"
+
+      - name: Build an NSIS setup.exe (optional, does not fail the job)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis --yes --no-progress
+          }
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { throw 'makensis.exe not found' }
+          & $makensis `
+              "/DOUTFILE=$((Get-Location).Path)\snow-shot-clipboard-history-setup.exe" `
+              "/DDISTDIR=$((Get-Location).Path)\dist\snow-shot-clipboard-history-win64" `
+              "snow_shot\tests\clipboard_history_app\installer.nsi"
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS build failed.' }
+          Write-Host "Setup.exe: $((Get-Item 'snow-shot-clipboard-history-setup.exe').Length) bytes"
+
+      - name: Upload portable zip and installer
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snow-shot-clipboard-history-${{ github.sha }}
+          path: |
+            snow-shot-clipboard-history-win64.zip
+            snow-shot-clipboard-history-win64.zip.sha256
+            snow-shot-clipboard-history-setup.exe
+          if-no-files-found: warn
+          retention-days: 30
 
   # Requires a runner that already has VS 18 2026, the custom static Qt 6.12
   # kit (SNOW_QT_STATIC_DIR) and the pinned vcpkg checkout. Stock GitHub
