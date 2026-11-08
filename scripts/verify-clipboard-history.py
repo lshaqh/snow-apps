@@ -281,6 +281,36 @@ for forbidden, label in [
 ]:
     check(forbidden not in cpp, label)
 
+print("\n=== 9. 独立托盘包简体中文界面护栏 ===")
+# The portable build ships no .qm files, so it needs a compiled-in catalogue.
+# Guard against drift: every trHistory() source must be mapped, and every
+# embedded translation must match the zh_CN.ts catalogue exactly.
+app_main = text(SHOT / "tests/clipboard_history_app/main.cpp")
+pairs = re.findall(
+    r'\{\s*QStringLiteral\("([^"]*)"\)\s*,\s*QStringLiteral\("([^"]*)"\)\s*\}',
+    app_main)
+embedded = {source: translation for source, translation in pairs}
+check("class ChineseTranslator" in app_main and "QTranslator" in app_main,
+      "独立包内置中文 QTranslator")
+check("QCoreApplication::installTranslator(&translator)" in app_main,
+      "在任何控件创建之前安装翻译器")
+check("bool isEmpty() const override { return false; }" in app_main,
+      "覆盖 isEmpty()，避免 Qt 跳过未加载 .qm 的翻译器")
+check('std::strcmp(context, "ClipboardHistoryWindow")' in app_main,
+      "翻译器只作用于 ClipboardHistoryWindow context")
+missing = sorted(sources - set(embedded))
+extra = sorted(set(embedded) - sources)
+check(not missing and not extra,
+      "内置映射与 9 条文案一一对应（缺失: %s / 多余: %s）" % (missing, extra))
+zh_cn = catalogs["zh_CN"]
+mismatch = sorted(k for k in sources
+                  if k in embedded and embedded[k] != (zh_cn.get(k) or ""))
+check(not mismatch, "内置译文与 zh_CN.ts 逐条一致（不一致: %s）" % mismatch)
+check(all(any("\u4e00" <= ch <= "\u9fff" for ch in v) for v in embedded.values()),
+      "所有内置译文均为中文")
+check("打开剪贴板历史" in app_main and "退出" in app_main,
+      "托盘菜单本身保持中文")
+
 print("\n" + "=" * 64)
 print("检查项 %d，失败 %d" % (CHECKS, len(FAILURES)))
 if FAILURES:
