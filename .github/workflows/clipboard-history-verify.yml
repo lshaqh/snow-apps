@@ -76,6 +76,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Inventory preinstalled toolchain
         shell: pwsh
@@ -109,6 +111,18 @@ jobs:
           Write-Host "=== Hosted vcpkg ==="
           $hostedVcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
           if (Test-Path -LiteralPath $hostedVcpkg) { & $hostedVcpkg version --disable-metrics }
+
+      - name: Check audited static Qt source reachability
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $url = "https://download.qt.io/official_releases/qt/6.12/6.12.0/single/qt-everywhere-src-6.12.0.tar.xz"
+          try {
+            $r = Invoke-WebRequest -Uri $url -Method Head -TimeoutSec 30
+            Write-Host "Qt 6.12.0 source HEAD: $($r.StatusCode), bytes=$($r.Headers['Content-Length'])"
+          } catch {
+            Write-Warning "Qt source HEAD failed: $_"
+          }
 
       - name: Light bootstrap probe (no vcpkg source build, no static Qt)
         id: bootstrap_probe
