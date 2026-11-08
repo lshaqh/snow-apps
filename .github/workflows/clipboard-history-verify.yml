@@ -253,10 +253,29 @@ jobs:
 
           运行：双击 snow_shot_clipboard_history.exe，程序常驻系统托盘。
           唤起：Win+V（默认接管）或 Ctrl+Shift+V（兜底）。
-          选择：在历史窗口里双击条目，或选中后按 Enter，即回贴到当前焦点窗口。
+          选择：上下键选择，回车或双击条目回贴；直接输入字母/数字可筛选（中文输入法请用鼠标点选）。
+          取消：按 Esc、再按一次 Win+V、或点击窗口外部。取消不会改动剪贴板。
           设置：托盘右键可开关「接管 Win+V」；历史窗口内可调整保留条数（默认 200，上限 1000）。
           数据：历史保存在 %APPDATA%\snow-apps\SnowShotClipboardHistory\clipboard_history\。
           退出：托盘右键 -> 退出。关闭历史窗口不会退出程序。
+
+          粘贴说明
+          --------
+          历史窗口不会抢占输入焦点，因此文件管理器地址栏、记事本、浏览器输入框都能保持光标。
+          回贴时先把条目写回剪贴板，再优先直接投递给原来的输入控件，其余程序用 Ctrl+V 兜底。
+          请从目标窗口直接按 Win+V 唤起；若从托盘菜单打开且没有明确目标窗口，
+          内容仍会写入剪贴板，可手动按 Ctrl+V。
+
+          与 snow_shot 主程序的关系
+          --------
+          本包不是完整 snow_shot 安装包。snow_shot 主程序源码里已集成同一个
+          ClipboardHistoryController（ApplicationController 启动时 start()、退出时 shutdown()）。
+          完整安装包硬依赖 VS 18 2026 / MSVC >= 14.51、静态 Qt 6.12、CMake >= 4.2 和 vcpkg 重型库，
+          GitHub 托管 runner 编不动。在具备该工具链的机器上执行：
+            .\scripts\bootstrap.ps1 -Preset snow-shot-msvc-fast -Architecture x64
+            .\scripts\build.ps1 -Preset snow-shot-msvc-fast -Target snow_shot
+            .\scripts\package-snow-shot.ps1 -Architecture x64 -SkipBuild
+          即可得到带本功能的完整 snow_shot 安装包；便携包与集成版共用同一份控制器/存储源码。
 
           运行依赖
           --------
