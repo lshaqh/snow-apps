@@ -47,8 +47,8 @@ class ClipboardHistoryStore final {
     void clear();
     void setMaximumEntries(int value);
 
-    [[nodiscard]] const QVector<ClipboardHistoryEntry>& entries() const { return entries_; }
-    [[nodiscard]] int maximumEntries() const { return maximumEntries_; }
+    [[nodiscard]] const QVector<ClipboardHistoryEntry>& entries() const { return m_entries; }
+    [[nodiscard]] int maximumEntries() const { return m_maximumEntries; }
     [[nodiscard]] QString imageDirectory() const;
     [[nodiscard]] QString imagePath(const QString& imageFile) const;
 

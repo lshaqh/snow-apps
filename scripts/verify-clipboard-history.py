@@ -7,6 +7,8 @@ This is the offline half of the check. It verifies:
   * include guards match filenames,
   * Windows-only types stay inside Q_OS_WIN blocks,
   * every translatable source string has a filled catalog entry,
+  * the two MSVC compile errors seen in CI run #1 never come back
+    (QStringLiteral with a variable argument, undeclared accessor members),
   * the C++ ClipboardHistoryGuard state machine reproduces every assertion in
     tests/clipboard_history_guard_tests.cpp (a faithful Python mirror).
 
@@ -221,6 +223,35 @@ for i in range(30):
         outcome = g2.evaluate(seq, clock + Guard.SETTLE_DELAY)
         ext += outcome == Guard.RECORD
 check(ext == 20 and own == 10, "高频 30 次：外部 20 记录 / 自身 10 跳过（%d/%d）" % (ext, own))
+
+print("\n=== 7. CI 编译错误防回归 ===")
+# QStringLiteral / QLatin1String are macros that require a string literal.
+# Passing a constexpr `const char*` variable expands into invalid C++
+# (MSVC: C2146 "missing ')' before identifier"). CI run #1 caught three of
+# these in clipboardhistorystore.cpp.
+macro_misuse = []
+scanned = NEW_FILES + ["tests/clipboard_history_smoke/main.cpp"]
+for relative in scanned:
+    source = text(SHOT / relative)
+    for macro in ("QStringLiteral", "QLatin1String"):
+        for match in re.finditer(r"\b%s\(\s*([^,\)\s]+)" % macro, source):
+            argument = match.group(1)
+            if not argument.startswith('"'):
+                macro_misuse.append("%s: %s(%s)" % (relative, macro, argument))
+check(not macro_misuse,
+      "QStringLiteral/QLatin1String 只接受字符串字面量（误用: %s）"
+      % (", ".join(macro_misuse) if macro_misuse else "无"))
+
+# CI run #1 also hit C2065: inline accessors returned entries_ /
+# maximumEntries_ while the members are named m_entries / m_maximumEntries.
+store_header = text(SHOT / NEW_FILES[1])
+declared = set(re.findall(r"\b(m_\w+)\s*(?:=[^;]*)?;", store_header))
+returned = set(re.findall(r"\breturn\s+(\w+)\s*;", store_header))
+undeclared = sorted(returned - declared)
+check(declared, "clipboardhistorystore.h 能解析出 m_ 成员声明")
+check(not undeclared,
+      "clipboardhistorystore.h 内联访问器只返回已声明成员（未声明: %s）"
+      % (", ".join(undeclared) if undeclared else "无"))
 
 print("\n" + "=" * 64)
 print("检查项 %d，失败 %d" % (CHECKS, len(FAILURES)))

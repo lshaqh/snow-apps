@@ -110,7 +110,7 @@ ClipboardHistoryStore::ClipboardHistoryStore(QString rootDirectory, int maximumE
       m_maximumEntries(std::max(1, maximumEntries)) {}
 
 QString ClipboardHistoryStore::imageDirectory() const {
-    return QDir(m_rootDirectory).filePath(QStringLiteral(kImageDirectoryName));
+    return QDir(m_rootDirectory).filePath(QString::fromUtf8(kImageDirectoryName));
 }
 
 QString ClipboardHistoryStore::imagePath(const QString& imageFile) const {
@@ -121,7 +121,7 @@ QString ClipboardHistoryStore::imagePath(const QString& imageFile) const {
 }
 
 bool ClipboardHistoryStore::load(QString* error) {
-    QFile file(QDir(m_rootDirectory).filePath(QStringLiteral(kIndexFileName)));
+    QFile file(QDir(m_rootDirectory).filePath(QString::fromUtf8(kIndexFileName)));
     if (!file.exists()) {
         m_entries.clear();
         return true;
@@ -170,7 +170,7 @@ bool ClipboardHistoryStore::save(QString* error) const {
     root.insert(QStringLiteral("version"), kStoreVersion);
     root.insert(QStringLiteral("entries"), array);
 
-    QSaveFile file(QDir(m_rootDirectory).filePath(QStringLiteral(kIndexFileName)));
+    QSaveFile file(QDir(m_rootDirectory).filePath(QString::fromUtf8(kIndexFileName)));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         assignError(error, QStringLiteral("Cannot open clipboard history index for writing"));
         return false;
