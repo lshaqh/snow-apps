@@ -1,0 +1,195 @@
+name: Clipboard History Verification
+
+# Verification levels:
+#   1. logic      - pure C++/Python checks, no toolchain needed (seconds)
+#   2. smoke      - real C++ compile + link against an official Qt desktop kit
+#                   on a stock GitHub-hosted Windows runner (minutes)
+#   3. package    - full snow_shot installer; requires a self-hosted runner
+#                   preloaded with VS 18 2026, the custom static Qt 6.12 kit
+#                   and the pinned vcpkg baseline. Disabled by default.
+on:
+  # Pushing to main is intentionally NOT a trigger: the verifier dispatches
+  # this workflow explicitly so the run is unambiguous and inputs are set.
+  push:
+    branches:
+      - 'clipboard-history/**'
+    paths:
+      - 'snow_shot/include/snow_shot/presentation/clipboardhistory*.h'
+      - 'snow_shot/src/presentation/services/clipboardhistory*.cpp'
+      - 'snow_shot/src/app/applicationcontroller.cpp'
+      - 'snow_shot/CMakeLists.txt'
+      - 'snow_shot/i18n/**'
+      - 'snow_shot/tests/clipboard_history_guard_tests.cpp'
+      - 'snow_shot/tests/clipboard_history_smoke/**'
+      - 'scripts/verify-clipboard-history.py'
+      - 'scripts/verify-win-v-hotkey.py'
+      - '.github/workflows/clipboard-history-verify.yml'
+  workflow_dispatch:
+    inputs:
+      qt_version:
+        description: Qt version for the compile smoke test (6.8.3 is the safe fallback)
+        default: '6.12.0'
+        type: string
+      full_package:
+        description: Also build the full installer (needs a prepared self-hosted runner)
+        default: false
+        type: boolean
+      runner_label:
+        description: Self-hosted runner label used by the full_package job
+        default: 'windows-2025-vs2026'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clipboard-history-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  logic:
+    name: Logic, wiring, catalogs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compile and run the C++ guard state machine (standard library only)
+        run: |
+          g++ -std=c++17 -Wall -Wextra \
+            -I snow_shot/include \
+            -o "${RUNNER_TEMP}/clipboard_history_guard_tests" \
+            snow_shot/tests/clipboard_history_guard_tests.cpp
+          "${RUNNER_TEMP}/clipboard_history_guard_tests"
+
+      - name: Integration static + behavioural checks
+        run: python scripts/verify-clipboard-history.py
+
+      - name: Translation catalog check
+        run: python snow_shot/scripts/translation_catalogs.py check --catalog-dir snow_shot/i18n
+
+      - name: Translation catalog merge (Full and Mini, as CMake does)
+        run: |
+          python snow_shot/scripts/translation_catalogs.py merge \
+            --catalog-dir snow_shot/i18n --output-dir "${RUNNER_TEMP}/i18n-full"
+          python snow_shot/scripts/translation_catalogs.py merge \
+            --catalog-dir snow_shot/i18n --output-dir "${RUNNER_TEMP}/i18n-mini" \
+            --exclude-module translation --exclude-context SnowShotApiClient
+
+  smoke:
+    name: Real C++ compile + link (Qt on Windows)
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # install-qt-action sets up its own Python >=3.14 (aqtinstall needs it).
+
+      # aqtinstall 3.3.0 cannot parse the Qt 6.11+ Windows repository layout.
+      # This patched aqtinstall is the known-good way to fetch Qt 6.12.0.
+      - name: Install Qt (project version)
+        id: qt_primary
+        continue-on-error: true
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ inputs.qt_version || '6.12.0' }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          dir: ${{ runner.workspace }}/qt-primary
+          cache: true
+          aqtsource: git+https://github.com/jdpurcell/aqtinstall.git@6f0f842da47c744cdc814cd94da9828d934d7bf0
+
+      # If 6.12 cannot be fetched (mirror/patch drift), fall back to a Qt the
+      # action supports out of the box. The new module uses only long-stable
+      # Core/Gui/Widgets APIs, so this still catches compile and link errors.
+      - name: Install Qt (safe fallback)
+        if: steps.qt_primary.outcome == 'failure'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          dir: ${{ runner.workspace }}/qt-fallback
+          cache: true
+
+      - name: Record the Qt root actually used
+        shell: pwsh
+        run: |
+          "QT_SMOKE_ROOT=$env:QT_ROOT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Qt root: $env:QT_ROOT_DIR"
+
+      - name: Configure standalone smoke project
+        shell: pwsh
+        run: |
+          cmake -S snow_shot/tests/clipboard_history_smoke `
+                -B build/clipboard-smoke `
+                -G "Visual Studio 17 2022" -A x64 `
+                "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
+
+      - name: Build every new translation unit
+        shell: pwsh
+        run: |
+          cmake --build build/clipboard-smoke --config Release --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw 'C++ compile/link failed.' }
+
+      - name: Run the guard unit test
+        shell: pwsh
+        run: |
+          ctest --test-dir build/clipboard-smoke -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw 'Guard unit test failed.' }
+
+      - name: Win+V hook probe (informational; CI session may be non-interactive)
+        continue-on-error: true
+        shell: pwsh
+        run: python scripts/verify-win-v-hotkey.py --selftest --simulate-winv
+
+      - name: Upload compiled smoke binaries and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipboard-history-smoke-${{ github.sha }}
+          path: |
+            build/clipboard-smoke/**/clipboard_history_guard_tests.exe
+            build/clipboard-smoke/**/clipboard_history_smoke.exe
+            build/clipboard-smoke/**/snow_shot_clipboard_history.lib
+            build/clipboard-smoke/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  # Requires a runner that already has VS 18 2026, the custom static Qt 6.12
+  # kit (SNOW_QT_STATIC_DIR) and the pinned vcpkg checkout. Stock GitHub
+  # runners cannot satisfy these prerequisites, so this job is opt-in.
+  package:
+    name: Full installer package (self-hosted only)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_package }}
+    runs-on: ${{ inputs.runner_label || 'windows-2025-vs2026' }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bootstrap pinned toolchain
+        shell: pwsh
+        run: ./scripts/bootstrap.ps1 -Preset snow-shot-msvc-fast -Architecture x64
+
+      - name: Build snow_shot
+        shell: pwsh
+        run: ./scripts/build.ps1 -Preset snow-shot-msvc-fast -Target snow_shot
+
+      - name: Package standalone installer
+        shell: pwsh
+        run: ./scripts/package-snow-shot.ps1 -Architecture x64 -SkipBuild
+
+      - name: Upload installer
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snow-shot-installer-${{ github.sha }}
+          path: |
+            artifacts/**/*.exe
+            artifacts/**/*.msix
+            artifacts/**/*.zip
+          if-no-files-found: warn
