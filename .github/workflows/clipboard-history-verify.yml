@@ -348,6 +348,7 @@ jobs:
           选择：上下键选择，回车或双击条目回贴；直接输入字母/数字可筛选（中文输入法请用鼠标点选）。
           取消：按 Esc、再按一次 Win+V、或点击窗口外部。取消不会改动剪贴板。
           设置：托盘右键可开关「接管 Win+V」；历史窗口内可调整保留条数（默认 200，上限 1000）。
+          界面：简体中文，托盘菜单与历史窗口均为中文（内置翻译，无需额外 .qm 文件；暂不提供语言切换）。
           数据：历史保存在 %APPDATA%\snow-apps\SnowShotClipboardHistory\clipboard_history\。
           退出：托盘右键 -> 退出。关闭历史窗口不会退出程序。
 
@@ -362,8 +363,10 @@ jobs:
           --------
           本包不是完整 snow_shot 安装包。snow_shot 主程序源码里已集成同一个
           ClipboardHistoryController（ApplicationController 启动时 start()、退出时 shutdown()）。
-          完整安装包硬依赖 VS 18 2026 / MSVC >= 14.51、静态 Qt 6.12、CMake >= 4.2 和 vcpkg 重型库，
-          GitHub 托管 runner 编不动。在具备该工具链的机器上执行：
+          完整安装包硬依赖 VS 18 2026 / MSVC >= 14.51、静态 Qt 6.12、CMake >= 4.2 和 vcpkg 重型库。
+          GitHub 托管 runner 已自带 VS2026 / CMake 4.4 / Rust 等工具链，但仍需在 CI 上分阶段
+          现编定制静态 Qt 6.12 与全量 vcpkg 依赖（每个 job 有 6 小时上限）；本包绕开了这一步。
+          在已备好该依赖产物的机器上执行：
             .\scripts\bootstrap.ps1 -Preset snow-shot-msvc-fast -Architecture x64
             .\scripts\build.ps1 -Preset snow-shot-msvc-fast -Target snow_shot
             .\scripts\package-snow-shot.ps1 -Architecture x64 -SkipBuild
