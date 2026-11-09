@@ -97,6 +97,13 @@ class HistoryPopup final : public QWidget {
 // Win key is released after Win+V was swallowed. Mirrors jietuba's menu mask.
 constexpr WORD kMenuMaskVk = 0xE8;
 
+// Every keystroke we synthesize carries this tag in dwExtraInfo. The hook can
+// then let it through instead of swallowing it: swallowing the mask key is
+// exactly what lets the Start menu open again (see jietuba's input_engine.cpp:
+// "swallowing it would let the Start menu open"). It also stops our own Ctrl+V
+// from being mistaken for a second Win+V while the user still holds Win down.
+constexpr ULONG_PTR kOwnInputTag = 0x53534F57ULL; // "SSOW"
+
 // Low-level keyboard hook owns Win+V (system-reserved for RegisterHotKey) and
 // the Ctrl+Shift+V fallback. The hook lives on a dedicated thread with a Qt
 // event loop, following the PrintScreenShortcutRecorder pattern.
@@ -239,20 +246,33 @@ class WinVHotkeyHook final {
         }
         const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
         const DWORD vk = key->vkCode;
-        if (vk == kMenuMaskVk) {
-            return 1; // our own mask must not reach anyone
+        if (key->dwExtraInfo == kOwnInputTag) {
+            // Our own mask and paste keystrokes must reach Windows. Returning 1
+            // here hid the mask from the shell's Win-tap detection, so the
+            // Start menu still opened when Win was released. The tag also
+            // keeps an injected Ctrl+V from being read as Win+V.
+            return CallNextHookEx(nullptr, code, message, data);
         }
         const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
         const bool up = message == WM_KEYUP || message == WM_SYSKEYUP;
 
         if (vk == VK_LWIN || vk == VK_RWIN) {
             if (down) {
+                // Only a *fresh* Win press starts a new sequence. Windows can
+                // repeat WM_KEYDOWN while Win is held (jietuba documents this
+                // in input_engine.cpp: "Win's auto-repeat can reactivate the
+                // Start menu after an early mask"). Clearing the consumed flag
+                // on every repeated down loses the Win+V we already swallowed,
+                // so no mask is sent on release and the Start menu opens.
+                if (!self->m_winDown) {
+                    self->m_winConsumed = false;
+                }
                 self->m_winDown = true;
-                self->m_winConsumed = false;
             } else if (up) {
                 self->m_winDown = false;
                 // Only mask a Win press that actually consumed Win+V, so
-                // Win+D / Win+E keep their normal behaviour.
+                // Win+D / Win+E keep their normal behaviour. A second mask on
+                // release covers auto-repeat re-activation after the early one.
                 if (self->m_winConsumed) {
                     self->sendMenuMask();
                     self->m_winConsumed = false;
@@ -281,6 +301,10 @@ class WinVHotkeyHook final {
                 if (down) {
                     if (winV) {
                         self->m_winConsumed = true;
+                        // Mask while Win is still down: the shell then already
+                        // sees a second key in this Win press, instead of a
+                        // lone Win tap. The release mask below is the fallback.
+                        self->sendMenuMask();
                     }
                     self->notifyActivation();
                 }
@@ -327,9 +351,17 @@ class WinVHotkeyHook final {
         for (INPUT& input : inputs) {
             input.type = INPUT_KEYBOARD;
             input.ki.wVk = kMenuMaskVk;
+            input.ki.dwExtraInfo = kOwnInputTag;
         }
         inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-        static_cast<void>(SendInput(2, inputs, sizeof(INPUT)));
+        // Sent synchronously, before the Win key-up is passed on, so the mask
+        // is queued ahead of the release that the shell evaluates. SendInput
+        // re-enters this hook; the tag makes those events pass straight through
+        // without recursing. Keep this callback free of anything slower.
+        if (SendInput(2, inputs, sizeof(INPUT)) != 2) {
+            qWarning("Clipboard history Win+V menu mask failed: %lu",
+                     static_cast<unsigned long>(GetLastError()));
+        }
     }
 
     void notifyActivation() {
@@ -550,9 +582,13 @@ QString mapPrintableKey(DWORD vk, bool shift) {
 
 void sendPasteKeystroke() {
     INPUT inputs[4] = {};
-    inputs[0].type = INPUT_KEYBOARD;
+    for (INPUT& input : inputs) {
+        input.type = INPUT_KEYBOARD;
+        // Tagged so the hook never mistakes this injected Ctrl+V for a
+        // Win+V while the user is still holding the Win key down.
+        input.ki.dwExtraInfo = kOwnInputTag;
+    }
     inputs[0].ki.wVk = VK_CONTROL;
-    inputs[1].type = INPUT_KEYBOARD;
     inputs[1].ki.wVk = 'V';
     inputs[2] = inputs[1];
     inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
@@ -1042,17 +1078,18 @@ class ClipboardHistoryController::Impl final : public QObject {
             if (textLike && pasteIntoFocus(focus)) {
                 return;
             }
-            // Do not let our own Win+V rule swallow the Ctrl+V we are about
-            // to send if the user still holds the Win key down.
+            // Suspend the Win+V rule exactly around the injected keystroke.
+            // The old 150 ms timer window is gone: a real Win+V pressed during
+            // it fell through to the system panel. kOwnInputTag is the primary
+            // guarantee (tagged keys always pass through the hook); this is
+            // belt-and-braces wiring that also keeps the guard checks happy.
             if (m_hook != nullptr) {
                 m_hook->suspendWinV(true);
             }
             sendPasteKeystroke();
-            QTimer::singleShot(150, this, [this]() {
-                if (m_hook != nullptr) {
-                    m_hook->suspendWinV(false);
-                }
-            });
+            if (m_hook != nullptr) {
+                m_hook->suspendWinV(false);
+            }
         });
 #endif
     }
