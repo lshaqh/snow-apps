@@ -78,17 +78,29 @@ class HistoryPopup final : public QWidget {
     // displayed with SW_SHOWNOACTIVATE can land behind it. Placing the native
     // handle at HWND_TOPMOST with SWP_NOACTIVATE makes the picker visible over
     // the Start menu while still never taking the foreground or the caret.
-    void ensureTopmost() {
+    bool ensureTopmost() {
 #ifdef Q_OS_WIN
         if (!isVisible()) {
-            return;
+            return false;
         }
         const HWND handle = reinterpret_cast<HWND>(winId());
         if (handle == nullptr) {
-            return;
+            return false;
         }
-        SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        BOOL ok = SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0,
+                               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // A WS_EX_NOACTIVATE window can lose the topmost bit depending on how
+        // Qt created it; assert the style explicitly as a second guard.
+        const LONG_PTR ex = GetWindowLongPtrW(handle, GWL_EXSTYLE);
+        if ((ex & WS_EX_TOPMOST) == 0) {
+            SetWindowLongPtrW(handle, GWL_EXSTYLE, ex | WS_EX_TOPMOST);
+            ok = SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0,
+                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                              SWP_FRAMECHANGED) || ok;
+        }
+        return ok != FALSE;
+#else
+        return false;
 #endif
     }
 
@@ -675,9 +687,13 @@ ForegroundInfo inspectForeground() {
 
 void injectEscape() {
     INPUT inputs[2] = {};
+    const WORD scan = static_cast<WORD>(MapVirtualKeyW(VK_ESCAPE, MAPVK_VK_TO_VSC));
     for (INPUT& input : inputs) {
         input.type = INPUT_KEYBOARD;
         input.ki.wVk = VK_ESCAPE;
+        // Some UWP/CoreWindow input hosts ignore synthetic key events whose
+        // lParam carries no scan code, so fill it as well as the virtual key.
+        input.ki.wScan = scan;
         // The tag makes the hook pass this through. Untagged, the hook would
         // read it as a picker navigation key and close our own window instead.
         input.ki.dwExtraInfo = kOwnInputTag;
@@ -701,6 +717,102 @@ void logZOrder(const QString& message) {
     out << '[' << QDateTime::currentDateTime().toString(Qt::ISODate) << "] "
         << message << '\n';
 }
+
+// Giving an ordinary desktop window the foreground is what makes the shell's
+// Start/Search flyout light-dismiss. A synthetic ESC can be swallowed by a UWP
+// input host (or only clear the search box), so this is the primary mechanism.
+HWND findDesktopWindowToActivate() {
+    const DWORD selfProcess = GetCurrentProcessId();
+    for (HWND hwnd = GetTopWindow(nullptr); hwnd != nullptr;
+         hwnd = GetNextWindow(hwnd, GW_HWNDNEXT)) {
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) {
+            continue;
+        }
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == 0 || pid == selfProcess) {
+            continue;
+        }
+        wchar_t cls[128]{};
+        GetClassNameW(hwnd, cls, 128);
+        const std::wstring_view name(cls);
+        if (name == L"Windows.UI.Core.CoreWindow" ||
+            name == L"Windows.UI.Input.InputSite.WindowClass" ||
+            name == L"XamlExplorerHostIslandWindow" ||
+            name == L"Shell_TrayWnd" || name == L"Shell_SecondaryTrayWnd" ||
+            name == L"Progman" || name == L"WorkerW") {
+            continue;
+        }
+        RECT rect{};
+        if (GetWindowRect(hwnd, &rect) && rect.right - rect.left < 160) {
+            continue;
+        }
+        return hwnd;
+    }
+    // Nothing ordinary is open: activating the desktop still dismisses Start.
+    HWND desktop = FindWindowW(L"Progman", nullptr);
+    if (desktop == nullptr) {
+        desktop = GetShellWindow();
+    }
+    return desktop;
+}
+
+bool activateForDismiss(HWND target) {
+    if (target == nullptr || !IsWindow(target)) {
+        return false;
+    }
+    const DWORD current = GetCurrentThreadId();
+    const DWORD targetThread = GetWindowThreadProcessId(target, nullptr);
+    const bool attached = targetThread != 0 && targetThread != current &&
+                          AttachThreadInput(current, targetThread, TRUE) != FALSE;
+    if (IsIconic(target)) {
+        ShowWindow(target, SW_RESTORE);
+    }
+    BringWindowToTop(target);
+    const BOOL ok = SetForegroundWindow(target);
+    if (attached) {
+        AttachThreadInput(current, targetThread, FALSE);
+    }
+    return ok != FALSE;
+}
+
+// Rebuild the caret snapshot against a real desktop window. When Start is
+// open, captureFocusSnapshot() would otherwise record the shell flyout itself
+// as the paste target, which is both wrong and unusable.
+FocusSnapshot snapshotForWindow(HWND window) {
+    FocusSnapshot snapshot;
+    snapshot.foreground = window;
+    const DWORD tid = window != nullptr ? GetWindowThreadProcessId(window, nullptr) : 0;
+    GUITHREADINFO info{};
+    info.cbSize = sizeof(GUITHREADINFO);
+    if (tid != 0 && GetGUIThreadInfo(tid, &info)) {
+        snapshot.focus = info.hwndFocus != nullptr ? info.hwndFocus : info.hwndActive;
+    }
+    if (snapshot.focus == nullptr) {
+        snapshot.focus = window;
+    }
+    if (snapshot.focus != nullptr) {
+        snapshot.thread = GetWindowThreadProcessId(snapshot.focus, nullptr);
+        snapshot.editable = isEditableControl(snapshot.focus);
+    }
+    return snapshot;
+}
+
+// Returns the desktop window that should now own the caret, or nullptr.
+HWND dismissShellFlyout() {
+    const HWND target = findDesktopWindowToActivate();
+    injectEscape();
+    const bool activated = activateForDismiss(target);
+    const ForegroundInfo after = inspectForeground();
+    logZOrder(QStringLiteral("dismiss target=0x%1 esc=1 activate=%2 "
+                             "fg_after=%3 proc_after=%4 shell_after=%5")
+                  .arg(QString::number(reinterpret_cast<quintptr>(target), 16))
+                  .arg(activated ? 1 : 0)
+                  .arg(after.className)
+                  .arg(after.processName)
+                  .arg(after.shellFlyout ? 1 : 0));
+    return target;
+}
 #endif // Q_OS_WIN
 
 } // namespace
@@ -722,7 +834,7 @@ class ClipboardHistoryController::Impl final : public QObject {
         }
         m_started = true;
 #ifdef Q_OS_WIN
-        logZOrder(QStringLiteral("start build=v3-zorder compiled=") +
+        logZOrder(QStringLiteral("start build=v4-lightdismiss compiled=") +
                   QString::fromLatin1(__DATE__ " " __TIME__));
 #endif
         loadSettings();
@@ -827,11 +939,14 @@ class ClipboardHistoryController::Impl final : public QObject {
                       .arg(foreground.shellFlyout ? 1 : 0));
         if (foreground.shellFlyout) {
             // The Start menu sits in a Z-order band that no third-party window
-            // can reach. Dismiss it, wait for the light-dismiss animation, then
-            // show the picker on a clear desktop.
-            injectEscape();
+            // can reach. Hand the foreground back to a normal desktop window
+            // (light-dismiss), wait for the animation, then show the picker.
+            const HWND target = dismissShellFlyout();
+            if (target != nullptr) {
+                m_focusSnapshot = snapshotForWindow(target);
+            }
             m_pendingShow = true;
-            QTimer::singleShot(140, this, [this]() { presentPicker(); });
+            QTimer::singleShot(160, this, [this]() { presentPicker(); });
             return;
         }
 #endif
@@ -850,7 +965,26 @@ class ClipboardHistoryController::Impl final : public QObject {
         // Keeps the picker above ordinary topmost windows (the Start menu is
         // handled by dismissing it instead). Re-assert on the next few turns
         // and then on a timer while the picker stays open.
-        m_popup->ensureTopmost();
+        const bool topmostOk = m_popup->ensureTopmost();
+        const HWND hwnd = reinterpret_cast<HWND>(m_popup->winId());
+        const LONG_PTR ex = hwnd != nullptr ? GetWindowLongPtrW(hwnd, GWL_EXSTYLE) : 0;
+        logZOrder(QStringLiteral("present hwnd=0x%1 ex=0x%2 topmost=%3 noact=%4 "
+                                 "visible=%5 topmostCall=%6")
+                      .arg(QString::number(reinterpret_cast<quintptr>(hwnd), 16))
+                      .arg(QString::number(static_cast<qulonglong>(ex), 16))
+                      .arg((ex & WS_EX_TOPMOST) != 0 ? 1 : 0)
+                      .arg((ex & WS_EX_NOACTIVATE) != 0 ? 1 : 0)
+                      .arg(hwnd != nullptr && IsWindowVisible(hwnd) ? 1 : 0)
+                      .arg(topmostOk ? 1 : 0));
+        RECT rect{};
+        if (hwnd != nullptr && GetWindowRect(hwnd, &rect)) {
+            logZOrder(QStringLiteral("present rect=%1,%2 %3x%4 fg=%5")
+                          .arg(rect.left)
+                          .arg(rect.top)
+                          .arg(rect.right - rect.left)
+                          .arg(rect.bottom - rect.top)
+                          .arg(inspectForeground().className));
+        }
         constexpr int delays[] = {0, 60, 180};
         for (const int delay : delays) {
             QTimer::singleShot(delay, this, [this]() { refreshTopmost(); });
