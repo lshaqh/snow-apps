@@ -8,10 +8,15 @@
 #include <QClipboard>
 #include <QCloseEvent>
 #include <QCoreApplication>
+#include <QCursor>
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
+#include <QFile>
 #include <QGuiApplication>
+#include <QScreen>
+#include <QString>
+#include <QTextStream>
 #include <QHBoxLayout>
 #include <QImage>
 #include <QKeyEvent>
@@ -616,6 +621,86 @@ void sendPasteKeystroke() {
     inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
     static_cast<void>(SendInput(4, inputs, sizeof(INPUT)));
 }
+
+// Windows 8+ places the Start menu and other shell flyouts in dedicated
+// Z-order bands (ZBID_IMMERSIVE_MOGO / ZBID_IMMERSIVE_SEARCH). Every
+// third-party window lives in ZBID_DESKTOP, so neither WS_EX_TOPMOST nor
+// SetWindowPos(HWND_TOPMOST) can ever put it above the Start menu; the bands
+// do not mix. The only workable behaviour is to dismiss the flyout first,
+// exactly as the system's own Win+V panel does.
+struct ForegroundInfo {
+    QString className;
+    QString processName;
+    bool shellFlyout = false;
+};
+
+ForegroundInfo inspectForeground() {
+    ForegroundInfo info;
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr) {
+        return info;
+    }
+    wchar_t windowClass[128]{};
+    GetClassNameW(foreground, windowClass, 128);
+    info.className = QString::fromWCharArray(windowClass);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(foreground, &pid);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process != nullptr) {
+        wchar_t image[MAX_PATH]{};
+        DWORD length = MAX_PATH;
+        if (QueryFullProcessImageNameW(process, 0, image, &length)) {
+            const std::wstring_view full(image, length);
+            const auto slash = full.find_last_of(L'\\');
+            const auto base = slash == std::wstring_view::npos
+                                  ? full
+                                  : full.substr(slash + 1);
+            info.processName =
+                QString::fromWCharArray(base.data(), static_cast<int>(base.size()));
+        }
+        CloseHandle(process);
+    }
+    const bool immersiveClass =
+        info.className == QStringLiteral("Windows.UI.Core.CoreWindow") ||
+        info.className == QStringLiteral("Windows.UI.Input.InputSite.WindowClass") ||
+        info.className == QStringLiteral("XamlExplorerHostIslandWindow");
+    const bool shellProcess =
+        info.processName == QStringLiteral("StartMenuExperienceHost.exe") ||
+        info.processName == QStringLiteral("SearchHost.exe") ||
+        info.processName == QStringLiteral("ShellExperienceHost.exe") ||
+        info.processName == QStringLiteral("SearchApp.exe");
+    info.shellFlyout = immersiveClass && shellProcess;
+    return info;
+}
+
+void injectEscape() {
+    INPUT inputs[2] = {};
+    for (INPUT& input : inputs) {
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_ESCAPE;
+        // The tag makes the hook pass this through. Untagged, the hook would
+        // read it as a picker navigation key and close our own window instead.
+        input.ki.dwExtraInfo = kOwnInputTag;
+    }
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    if (SendInput(2, inputs, sizeof(INPUT)) != 2) {
+        qWarning("Clipboard history Start menu dismissal failed: %lu",
+                 static_cast<unsigned long>(GetLastError()));
+    }
+}
+
+void logZOrder(const QString& message) {
+    // Written next to the exe, so a tester can tell at a glance which build
+    // is running and whether the Start menu was detected and dismissed.
+    QFile file(QCoreApplication::applicationDirPath() +
+               QStringLiteral("/zorder.log"));
+    if (!file.open(QIODevice::Append | QIODevice::Text)) {
+        return;
+    }
+    QTextStream out(&file);
+    out << '[' << QDateTime::currentDateTime().toString(Qt::ISODate) << "] "
+        << message << '\n';
+}
 #endif // Q_OS_WIN
 
 } // namespace
@@ -636,6 +721,10 @@ class ClipboardHistoryController::Impl final : public QObject {
             return;
         }
         m_started = true;
+#ifdef Q_OS_WIN
+        logZOrder(QStringLiteral("start build=v3-zorder compiled=") +
+                  QString::fromLatin1(__DATE__ " " __TIME__));
+#endif
         loadSettings();
         m_store.setMaximumEntries(m_maximumEntries);
         QString error;
@@ -706,6 +795,7 @@ class ClipboardHistoryController::Impl final : public QObject {
     }
 
     void closeHistory() {
+        m_pendingShow = false;
         if (m_popup != nullptr && m_popup->isVisible()) {
             m_popup->hide();
         }
@@ -721,7 +811,7 @@ class ClipboardHistoryController::Impl final : public QObject {
     }
 
     void openHistory() {
-        if (!m_enabled) {
+        if (!m_enabled || m_pendingShow) {
             return;
         }
         ensureWindow();
@@ -730,16 +820,36 @@ class ClipboardHistoryController::Impl final : public QObject {
         // Remember the caret owner before the picker appears. show()/raise()
         // must not activate it: the target editor keeps the foreground.
         m_focusSnapshot = captureFocusSnapshot();
+        const ForegroundInfo foreground = inspectForeground();
+        logZOrder(QStringLiteral("open fg_class=%1 fg_proc=%2 shell=%3")
+                      .arg(foreground.className)
+                      .arg(foreground.processName)
+                      .arg(foreground.shellFlyout ? 1 : 0));
+        if (foreground.shellFlyout) {
+            // The Start menu sits in a Z-order band that no third-party window
+            // can reach. Dismiss it, wait for the light-dismiss animation, then
+            // show the picker on a clear desktop.
+            injectEscape();
+            m_pendingShow = true;
+            QTimer::singleShot(140, this, [this]() { presentPicker(); });
+            return;
+        }
 #endif
+        presentPicker();
+    }
+
+    void presentPicker() {
+        m_pendingShow = false;
+        if (m_popup == nullptr) {
+            return;
+        }
+        positionPicker();
         m_popup->show();
         m_popup->raise();
 #ifdef Q_OS_WIN
-        // Win+V is often used while the Start menu is already open, or the
-        // shell raises the Start menu again when Win is released right after
-        // the picker appears. Both cases leave a non-activating picker hidden
-        // behind a topmost shell window, so assert HWND_TOPMOST immediately,
-        // repeat on the next event-loop turns, then keep a low-frequency
-        // refresh alive until the picker is dismissed.
+        // Keeps the picker above ordinary topmost windows (the Start menu is
+        // handled by dismissing it instead). Re-assert on the next few turns
+        // and then on a timer while the picker stays open.
         m_popup->ensureTopmost();
         constexpr int delays[] = {0, 60, 180};
         for (const int delay : delays) {
@@ -757,11 +867,35 @@ class ClipboardHistoryController::Impl final : public QObject {
 #endif
     }
 
+    void positionPicker() {
+        QScreen* screen = QGuiApplication::screenAt(QCursor::pos());
+        if (screen == nullptr) {
+            screen = QGuiApplication::primaryScreen();
+        }
+        if (screen == nullptr || m_popup == nullptr) {
+            return;
+        }
+        const QRect area = screen->availableGeometry();
+        const QSize size = m_popup->size();
+        const int x = area.left() + (area.width() - size.width()) / 2;
+        const int y = area.top() + (area.height() - size.height()) / 2;
+        m_popup->move(qBound(area.left(), x,
+                             qMax(area.left(), area.right() - size.width() + 1)),
+                      qBound(area.top(), y,
+                             qMax(area.top(), area.bottom() - size.height() + 1)));
+    }
+
 #ifdef Q_OS_WIN
     void refreshTopmost() {
-        if (m_popup != nullptr && m_popup->isVisible()) {
-            m_popup->ensureTopmost();
+        if (m_popup == nullptr || !m_popup->isVisible()) {
+            return;
         }
+        // Win can be released after the picker opens and bring the Start menu
+        // back. Keep dismissing it rather than racing an unreachable band.
+        if (inspectForeground().shellFlyout) {
+            injectEscape();
+        }
+        m_popup->ensureTopmost();
     }
 #endif
 
@@ -1185,6 +1319,7 @@ class ClipboardHistoryController::Impl final : public QObject {
     QSpinBox* m_maximumSpin = nullptr;
     bool m_started = false;
     bool m_enabled = true;
+    bool m_pendingShow = false;
     bool m_takeOverWinV = true;
     int m_maximumEntries = 200;
     std::uint32_t m_lastObservedSequence = 0;
