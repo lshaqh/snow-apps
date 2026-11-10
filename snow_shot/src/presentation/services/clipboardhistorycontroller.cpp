@@ -67,6 +67,26 @@ class HistoryPopup final : public QWidget {
         resize(520, 460);
     }
 
+    // Qt's raise() only uses HWND_TOP, which puts a window at the head of the
+    // *normal* Z-order band. The Windows Start menu is topmost itself and
+    // re-asserts its position whenever Win is pressed or released, so a picker
+    // displayed with SW_SHOWNOACTIVATE can land behind it. Placing the native
+    // handle at HWND_TOPMOST with SWP_NOACTIVATE makes the picker visible over
+    // the Start menu while still never taking the foreground or the caret.
+    void ensureTopmost() {
+#ifdef Q_OS_WIN
+        if (!isVisible()) {
+            return;
+        }
+        const HWND handle = reinterpret_cast<HWND>(winId());
+        if (handle == nullptr) {
+            return;
+        }
+        SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+#endif
+    }
+
   protected:
     void keyPressEvent(QKeyEvent* event) override {
         if (event->key() == Qt::Key_Escape) {
@@ -626,6 +646,13 @@ class ClipboardHistoryController::Impl final : public QObject {
         m_settleTimer = new QTimer(this);
         m_settleTimer->setInterval(25);
         QObject::connect(m_settleTimer, &QTimer::timeout, this, &Impl::onSettleTick);
+#ifdef Q_OS_WIN
+        // The shell can put the Start menu back on top after our picker is
+        // shown, so keep re-asserting the topmost band while the picker is open.
+        m_topmostTimer = new QTimer(this);
+        m_topmostTimer->setInterval(250);
+        QObject::connect(m_topmostTimer, &QTimer::timeout, this, &Impl::refreshTopmost);
+#endif
         QClipboard* clipboard = QGuiApplication::clipboard();
         QObject::connect(clipboard, &QClipboard::dataChanged, this,
                          &Impl::onClipboardChanged);
@@ -653,6 +680,9 @@ class ClipboardHistoryController::Impl final : public QObject {
             m_settleTimer->stop();
         }
 #ifdef Q_OS_WIN
+        if (m_topmostTimer != nullptr) {
+            m_topmostTimer->stop();
+        }
         if (m_hook != nullptr) {
             m_hook->stop();
             m_hook.reset();
@@ -680,6 +710,9 @@ class ClipboardHistoryController::Impl final : public QObject {
             m_popup->hide();
         }
 #ifdef Q_OS_WIN
+        if (m_topmostTimer != nullptr) {
+            m_topmostTimer->stop();
+        }
         if (m_hook != nullptr) {
             m_hook->setPickerOpen(false);
         }
@@ -700,6 +733,22 @@ class ClipboardHistoryController::Impl final : public QObject {
 #endif
         m_popup->show();
         m_popup->raise();
+#ifdef Q_OS_WIN
+        // Win+V is often used while the Start menu is already open, or the
+        // shell raises the Start menu again when Win is released right after
+        // the picker appears. Both cases leave a non-activating picker hidden
+        // behind a topmost shell window, so assert HWND_TOPMOST immediately,
+        // repeat on the next event-loop turns, then keep a low-frequency
+        // refresh alive until the picker is dismissed.
+        m_popup->ensureTopmost();
+        constexpr int delays[] = {0, 60, 180};
+        for (const int delay : delays) {
+            QTimer::singleShot(delay, this, [this]() { refreshTopmost(); });
+        }
+        if (m_topmostTimer != nullptr) {
+            m_topmostTimer->start();
+        }
+#endif
         m_search->clear();
 #ifdef Q_OS_WIN
         if (m_hook != nullptr) {
@@ -707,6 +756,14 @@ class ClipboardHistoryController::Impl final : public QObject {
         }
 #endif
     }
+
+#ifdef Q_OS_WIN
+    void refreshTopmost() {
+        if (m_popup != nullptr && m_popup->isVisible()) {
+            m_popup->ensureTopmost();
+        }
+    }
+#endif
 
     void onOutsideClick(int x, int y) {
         if (m_popup == nullptr || !m_popup->isVisible()) {
@@ -1135,6 +1192,7 @@ class ClipboardHistoryController::Impl final : public QObject {
 #ifdef Q_OS_WIN
     std::unique_ptr<WinVHotkeyHook> m_hook;
     FocusSnapshot m_focusSnapshot;
+    QTimer* m_topmostTimer = nullptr;
 #endif
 };
 
